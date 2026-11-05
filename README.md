@@ -52,3 +52,4 @@
 | `panelWidth` | `480` | 播放器标签页的默认宽度（px） |
 | `profilePath` | 插件数据目录 | 匿名设备档案文件；删除即更换设备 |
 | `searchTerms` | `总裁/重生/逆袭` | 推荐不足时补充列表用的搜索词 |
+| `searchMode` | `remote` | `remote` 调红果搜索接口；`local` 只过滤已加载的列表（旧行为） |

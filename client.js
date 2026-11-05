@@ -562,6 +562,54 @@ window.__ModuleLoader__.load({
       const [source, setSource] = React.useState(preferredSource)
       const [feed, setFeed] = React.useState({ status: 'loading', items: [], error: undefined })
       const [query, setQuery] = React.useState('')
+      /** Remote search results; falls back to the local feed when the Host says so. */
+      const [remote, setRemote] = React.useState({ status: 'idle', items: [], source })
+      /** IME composition: do not search while the user is still typing pinyin. */
+      const [composing, setComposing] = React.useState(false)
+      const searchCache = React.useRef(new Map())
+      const [searchMode, setSearchMode] = React.useState('remote')
+      React.useEffect(() => {
+        callApi('/config')
+          .then((body) => setSearchMode(body.searchMode === 'local' ? 'local' : 'remote'))
+          .catch(() => {})
+      }, [])
+      React.useEffect(() => {
+        if (composing) return undefined
+        const q = query.trim()
+        if (!q) {
+          setRemote({ status: 'idle', items: [], source })
+          return undefined
+        }
+        if (searchMode === 'local') {
+          setRemote({ status: 'local', items: [], source })
+          return undefined
+        }
+        const key = `${source}:${q}`
+        const cached = searchCache.current.get(key)
+        if (cached && Date.now() - cached.at < 60_000) {
+          setRemote({ status: cached.mode === 'local' ? 'local' : 'ready', items: cached.items, source })
+          return undefined
+        }
+        let alive = true
+        const controller = new AbortController()
+        setRemote((prev) => ({ status: 'loading', items: prev.source === source ? prev.items : [], source }))
+        const timer = setTimeout(() => {
+          callApi(`/search?q=${encodeURIComponent(q)}&source=${encodeURIComponent(source)}`, { signal: controller.signal })
+            .then((body) => {
+              if (!alive) return
+              const mode = body.mode === 'local' ? 'local' : 'remote'
+              const items = body.items ?? []
+              if (searchCache.current.size >= 50) searchCache.current.delete(searchCache.current.keys().next().value)
+              searchCache.current.set(key, { at: Date.now(), items, mode })
+              setRemote({ status: mode === 'local' ? 'local' : 'ready', items, source })
+            })
+            .catch((error) => {
+              if (!alive || error?.name === 'AbortError') return
+              setRemote({ status: 'error', items: [], source })
+            })
+        }, 300)
+        return () => { alive = false; controller.abort(); clearTimeout(timer) }
+      }, [query, searchMode, composing, source])
       const [series, setSeries] = React.useState(undefined)
       const [seriesInfo, setSeriesInfo] = React.useState({ status: 'idle', episodes: [], error: undefined })
       const [current, setCurrent] = React.useState(undefined)
@@ -868,16 +916,24 @@ window.__ModuleLoader__.load({
       }, [feed.items, watched])
 
       const PAGE = 12
+      const term = query.trim()
+      const localMatches = term ? feed.items.filter((item) => String(item.title ?? '').includes(term)) : []
       // The featured drama is already on screen; the grid shows the others.
-      const pool = query.trim()
-        ? feed.items.filter((item) => String(item.title ?? '').includes(query.trim()))
+      const remoteReady = remote.source === source
+      const pool = term
+        ? remote.status === 'error' || remote.status === 'local'
+          ? localMatches
+          : remoteReady
+            ? remote.items.filter((item) => item && item.id)
+            : []
         : feed.items.filter((item) => item && item.id !== recommendation?.id)
       const pageCount = Math.max(1, Math.ceil(pool.length / PAGE))
-      const shownPage = query.trim() ? 0 : page % pageCount
+      const shownPage = page % pageCount
       const visible = pool.slice(shownPage * PAGE, shownPage * PAGE + PAGE)
       /** Next twelve; after the last page, fetch a fresh list and start over. */
       const nextBatch = () => {
         if (shownPage + 1 < pageCount) setPage(shownPage + 1)
+        else if (term) setPage(0)
         else {
           setPage(0)
           fetchFeed(true)
@@ -949,14 +1005,15 @@ window.__ModuleLoader__.load({
               t('player.historyOpen'),
               watched.length > 0 ? h('span', { className: 'hg-count' }, String(watched.length)) : null,
             ),
-        series ? null : h('button', { className: 'hg-btn', type: 'button', onClick: nextBatch, disabled: feed.status === 'loading' }, t('player.refresh')),
+        series || (term && pageCount <= 1) ? null : h('button', { className: 'hg-btn', type: 'button', onClick: nextBatch, disabled: term ? false : feed.status === 'loading' }, t('player.refresh')),
       )
 
       let content
       if (!series) {
         let grid
-        if (feed.status === 'error') grid = h(ErrorBox, { error: feed.error, onRetry: loadFeed })
-        else if (feed.status === 'loading' && visible.length === 0) grid = h('div', { className: 'hg-muted' }, t('player.loading'))
+        if (!term && feed.status === 'error') grid = h(ErrorBox, { error: feed.error, onRetry: loadFeed })
+        else if (!term && feed.status === 'loading' && visible.length === 0) grid = h('div', { className: 'hg-muted' }, t('player.loading'))
+        else if (term && remote.status === 'loading' && visible.length === 0) grid = h('div', { className: 'hg-muted' }, t('player.loading'))
         else if (visible.length === 0) grid = h('div', { className: 'hg-empty' }, t('player.noSource'))
         else
           grid = h(
@@ -1042,6 +1099,12 @@ window.__ModuleLoader__.load({
               placeholder: t('player.search'),
               value: query,
               onChange: (event) => {
+                setQuery(event.target.value)
+                setPage(0)
+              },
+              onCompositionStart: () => setComposing(true),
+              onCompositionEnd: (event) => {
+                setComposing(false)
                 setQuery(event.target.value)
                 setPage(0)
               },

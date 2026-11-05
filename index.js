@@ -33,6 +33,7 @@ function configSchema(z, DEFAULTS) {
     panelWidth: z.number().step(1).min(320).max(960).default(DEFAULTS.panelWidth),
     profilePath: z.string(),
     searchTerms: z.array(z.string()).default(DEFAULTS.searchTerms),
+    searchMode: z.union([z.const('remote'), z.const('local')]).default(DEFAULTS.searchMode),
   })
 }
 
@@ -42,9 +43,9 @@ function configSchema(z, DEFAULTS) {
  * the wrong type falls back to the default instead of failing activation.
  */
 export async function reflectConfig(raw = {}) {
-  const DEFAULTS = { autoPrompt: true, panelWidth: 480, searchTerms: ['总裁', '重生', '逆袭'] }
+  const DEFAULTS = { autoPrompt: true, panelWidth: 480, searchTerms: ['总裁', '重生', '逆袭'], searchMode: 'remote' }
   const input = Object.fromEntries(
-    Object.entries(raw ?? {}).filter(([key]) => ['autoPrompt', 'panelWidth', 'profilePath', 'searchTerms'].includes(key)),
+    Object.entries(raw ?? {}).filter(([key]) => ['autoPrompt', 'panelWidth', 'profilePath', 'searchTerms', 'searchMode'].includes(key)),
   )
   let value
   try {
@@ -59,6 +60,7 @@ export async function reflectConfig(raw = {}) {
     if (typeof input.profilePath === 'string') value.profilePath = input.profilePath
     if (Array.isArray(input.searchTerms)) value.searchTerms = input.searchTerms.map(String)
     if (!value.searchTerms.length) value.searchTerms = DEFAULTS.searchTerms
+    if (input.searchMode === 'remote' || input.searchMode === 'local') value.searchMode = input.searchMode
   }
   return { ...DEFAULTS, ...value }
 }
@@ -127,6 +129,30 @@ export function apply(ctx, config = {}) {
   let clientPromise
   let games = []
   let gamesAt = 0
+
+  /** Recent searches, so retyping a word does not spend device quota. */
+  const searchCache = new Map()
+  const SEARCH_CACHE_TTL = 60_000
+  const SEARCH_CACHE_MAX = 50
+
+  /**
+   * Rotate the anonymous device at most once per cooldown: concurrent searches
+   * hitting the rate limit must share one reset instead of replacing the
+   * profile several times.
+   */
+  let deviceReset
+  let deviceResetAt = 0
+  function rotateDevice(sdk) {
+    if (deviceReset) return deviceReset
+    if (Date.now() - deviceResetAt < 15_000) return Promise.resolve()
+    deviceReset = sdk.resetDevice().catch((error) => {
+      logger.warn?.(`[hongguo] device reset failed: ${error?.message ?? error}`)
+    }).finally(() => {
+      deviceReset = undefined
+      deviceResetAt = Date.now()
+    })
+    return deviceReset
+  }
 
   const logger = ctx.logger ?? { info() {}, warn() {}, error() {} }
   const VENDOR_DIR = join(dirname(fileURLToPath(import.meta.url)), 'vendor')
@@ -788,7 +814,7 @@ export function apply(ctx, config = {}) {
     if (path === '/config') {
       return json(async () => {
         const current = readConfig()
-        return { autoPrompt: current.autoPrompt, panelWidth: current.panelWidth, searchTerms: current.searchTerms, profilePath }
+        return { autoPrompt: current.autoPrompt, panelWidth: current.panelWidth, searchTerms: current.searchTerms, searchMode: current.searchMode, profilePath }
       })
     }
 
@@ -799,6 +825,48 @@ export function apply(ctx, config = {}) {
         running: list.some((agent) => agent?.status === 'running'),
         sessions: list.length,
       }))
+    }
+
+    if (path === '/search') {
+      return json(async () => {
+        const q = Array.from((url.searchParams.get('q') ?? '').trim()).slice(0, 40).join('')
+        if (!q) return { items: [] }
+        if (readConfig().searchMode === 'local') return { items: [], mode: 'local' }
+        const source = url.searchParams.get('source') === 'huangguo' ? 'huangguo' : 'hongguo'
+        const key = `${source}:${q}`
+        const hit = searchCache.get(key)
+        if (hit && Date.now() - hit.at < SEARCH_CACHE_TTL) return { items: hit.items }
+        let rows
+        if (source === 'huangguo') {
+          const sdk = await hgClient()
+          const page = await sdk.search(q, { pageSize: 24 })
+          rows = (page.items ?? [])
+            .filter((item) => item?.id)
+            .map((item) => ({
+              id: item.id,
+              title: item.title,
+              description: '',
+              cover: sdk.coverURL(item.verticalCover || item.horizontalCover || ''),
+              episodes: item.totalEpisode,
+            }))
+        } else {
+          const sdk = await client()
+          const page = async () => (await sdk.search(q, {})).items ?? []
+          let items
+          try {
+            items = await page()
+          } catch (error) {
+            if (error?.code !== 'ANONYMOUS_LIMITED') throw error
+            // The anonymous device is rate limited; rotate once and retry.
+            await rotateDevice(sdk)
+            items = await page()
+          }
+          rows = items.map(toRow)
+        }
+        searchCache.set(key, { at: Date.now(), items: rows })
+        if (searchCache.size > SEARCH_CACHE_MAX) searchCache.delete(searchCache.keys().next().value)
+        return { items: rows }
+      })
     }
 
     if (path === '/feed') {
