@@ -296,9 +296,20 @@ export function apply(ctx, config = {}) {
     return /(^|\.)(qznovelvod\.com|byteimg\.com|fqnovelpic\.com|douyinvod\.com|bytecdn\.cn|ibytedtos\.com|snssdk\.com|lkkwip\.cn|6cc2n\.com|uszim\.com|cloudfront\.net)$/.test(hostname)
   }
 
+  /** Reject loopback, private, and link-local destinations to block SSRF via DNS rebinding. */
+  const PRIVATE_IP = /^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|::1$|f[cd][0-9a-f]{2}:|fe80:)/i
+  async function resolvesToPrivateIp(hostname) {
+    const { lookup } = await import('node:dns/promises')
+    const addresses = await lookup(hostname, { all: true, verbatim: true })
+    return addresses.some((addr) => PRIVATE_IP.test(addr.address))
+  }
+
   async function proxyStream(mediaUrl) {
     const target = new URL(mediaUrl)
     if (!/^https?:$/.test(target.protocol) || !allowedHost(target.hostname)) {
+      throw Object.assign(new Error(`unsupported stream host: ${target.hostname}`), { status: 403 })
+    }
+    if (await resolvesToPrivateIp(target.hostname)) {
       throw Object.assign(new Error(`unsupported stream host: ${target.hostname}`), { status: 403 })
     }
     return { absolute: target.href }
