@@ -530,7 +530,7 @@ window.__ModuleLoader__.load({
     function DramaPlayer({ requested, compact }) {
       const t = useTranslate()
       /** Results of the server-side search for the current query. */
-      const [found, setFound] = React.useState({ status: 'idle', keyword: '', items: [], error: undefined })
+      const [found, setFound] = React.useState({ status: 'idle', keyword: '', items: [], cursor: '', hasMore: false, loadingMore: false, error: undefined })
       const [searchTick, setSearchTick] = React.useState(0)
       const [feed, setFeed] = React.useState({ status: 'loading', items: [], error: undefined })
       const [query, setQuery] = React.useState('')
@@ -814,21 +814,40 @@ window.__ModuleLoader__.load({
       // dramas. Typing waits for a pause, Enter searches at once, and a
       // reply for an older query is dropped.
       const keyword = query.trim()
+      /** One page of server-side search; an empty cursor asks for the first. */
+      const searchPage = (text, cursor) =>
+        callApi(`/search?q=${encodeURIComponent(text)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`)
       React.useEffect(() => {
         if (!keyword) {
-          setFound({ status: 'idle', keyword: '', items: [], error: undefined })
+          setFound({ status: 'idle', keyword: '', items: [], cursor: '', hasMore: false, loadingMore: false, error: undefined })
           return undefined
         }
         let stale = false
         setFound((previous) => ({ ...previous, status: 'loading', keyword }))
-        const timer = setTimeout(() => {
-          callApi(`/search?q=${encodeURIComponent(keyword)}`)
-            .then((body) => {
-              if (!stale) setFound({ status: 'ready', keyword, items: body.items ?? [], error: undefined })
-            })
-            .catch((error) => {
-              if (!stale) setFound({ status: 'error', keyword, items: [], error })
-            })
+        const timer = setTimeout(async () => {
+          // A first page carries only a handful of rows, so walk the cursor
+          // until a screenful is on hand; the rest loads on "换一批".
+          const items = []
+          let cursor = ''
+          let hasMore = true
+          try {
+            for (let attempt = 0; attempt < 3 && hasMore; attempt += 1) {
+              const body = await searchPage(keyword, cursor)
+              const seen = new Set(items.map((item) => item.id))
+              for (const item of body.items ?? []) {
+                if (!item?.id || seen.has(item.id)) continue
+                seen.add(item.id)
+                items.push(item)
+              }
+              cursor = body.cursor ?? ''
+              hasMore = body.hasMore === true && cursor !== ''
+              if (items.length >= 12) break
+            }
+          } catch (error) {
+            if (!stale) setFound({ status: 'error', keyword, items: [], cursor: '', hasMore: false, loadingMore: false, error })
+            return
+          }
+          if (!stale) setFound({ status: 'ready', keyword, items, cursor, hasMore, loadingMore: false, error: undefined })
         }, searchTick > 0 ? 0 : 400)
         return () => {
           stale = true
@@ -845,11 +864,60 @@ window.__ModuleLoader__.load({
       const pageCount = Math.max(1, Math.ceil(pool.length / PAGE))
       const shownPage = page % pageCount
       const visible = pool.slice(shownPage * PAGE, shownPage * PAGE + PAGE)
+      /**
+       * Append one more page of search results. A page holds only a handful of
+       * rows and the service repeats rows across pages, so keep walking the
+       * cursor until something new arrives.
+       */
+      const moreSearch = async () => {
+        const base = found
+        if (!base.hasMore || base.loadingMore || !base.cursor) return false
+        setFound((previous) => ({ ...previous, loadingMore: true }))
+        const seen = new Set(base.items.map((item) => item.id))
+        const added = []
+        let cursor = base.cursor
+        let hasMore = true
+        try {
+          for (let attempt = 0; attempt < 2 && hasMore; attempt += 1) {
+            const body = await searchPage(base.keyword, cursor)
+            for (const item of body.items ?? []) {
+              if (!item?.id || seen.has(item.id)) continue
+              seen.add(item.id)
+              added.push(item)
+            }
+            cursor = body.cursor ?? ''
+            hasMore = body.hasMore === true && cursor !== ''
+            if (added.length > 0) break
+          }
+        } catch {
+          setFound((previous) => ({ ...previous, loadingMore: false }))
+          return false
+        }
+        // The service repeats rows on later pages; a page with nothing new
+        // means this query is exhausted, whatever has_more claims.
+        if (added.length === 0) hasMore = false
+        setFound((previous) =>
+          previous.keyword !== base.keyword
+            ? previous
+            : { ...previous, items: [...previous.items, ...added], cursor, hasMore, loadingMore: false },
+        )
+        return added.length > 0
+      }
+
       /** Next twelve; after the last page, fetch a fresh list and start over. */
       const nextBatch = () => {
         if (shownPage + 1 < pageCount) setPage(shownPage + 1)
-        else if (keyword) setPage(0)
-        else {
+        else if (keyword) {
+          // Results for an older query are on their way out; ignore the click.
+          if (found.keyword !== keyword) return
+          // Ask the service for the next page first; only wrap when it is out.
+          if (!found.hasMore) {
+            setPage(0)
+            return
+          }
+          if (found.loadingMore) return
+          moreSearch().then((grew) => setPage(grew ? shownPage + 1 : 0))
+        } else {
           setPage(0)
           fetchFeed(true)
             .then((items) => setFeed({ status: 'ready', items, error: undefined }))
@@ -911,7 +979,7 @@ window.__ModuleLoader__.load({
               t('player.historyOpen'),
               watched.length > 0 ? h('span', { className: 'hg-count' }, String(watched.length)) : null,
             ),
-        series ? null : h('button', { className: 'hg-btn', type: 'button', onClick: nextBatch, disabled: feed.status === 'loading' }, t('player.refresh')),
+        series ? null : h('button', { className: 'hg-btn', type: 'button', onClick: nextBatch, disabled: feed.status === 'loading' || Boolean(keyword && found.loadingMore) }, t('player.refresh')),
       )
 
       let content

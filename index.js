@@ -721,19 +721,23 @@ export function apply(ctx, config = {}) {
     }
 
     // Real search on the service, not a filter over the cached list.
+    // One page is a handful of rows, so the cursor is passed both ways: the
+    // first call shows results at once, the client walks the rest.
     if (path === '/search') {
       const keyword = (url.searchParams.get('q') ?? '').trim().slice(0, 40)
+      const cursor = (url.searchParams.get('cursor') ?? '').trim().slice(0, 32)
       if (!keyword) return send(400, { ok: false, error: { message: 'empty query' } })
       return json(async () => {
         const sdk = await client()
+        const search = () => sdk.search(keyword, cursor ? { cursor } : {})
         let page
         try {
-          page = await sdk.search(keyword, {})
+          page = await search()
         } catch (error) {
           if (error?.code !== 'ANONYMOUS_LIMITED') throw error
           // The anonymous device ran out; a fresh one answers the same query.
           await sdk.resetDevice()
-          page = await sdk.search(keyword, {})
+          page = await search()
         }
         const seen = new Map()
         for (const item of page?.items ?? []) mergeRows(seen, item)
@@ -756,7 +760,7 @@ export function apply(ctx, config = {}) {
             }
           }),
         )
-        return { items: rows }
+        return { items: rows, cursor: page?.cursor ?? '', hasMore: page?.has_more === true }
       })
     }
 
