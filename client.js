@@ -154,7 +154,7 @@ window.__ModuleLoader__.load({
     const CSS = `
 .hg-root{display:flex;flex-direction:column;height:100%;min-height:0;color:var(--dsw-alias-label-primary);font-size:13px;}
 .hg-head{display:flex;align-items:center;gap:8px;padding:10px 12px 8px;flex:none;}
-.hg-source{appearance:none;border:0;background:none;padding:0;cursor:pointer;display:flex;align-items:center;border-radius:8px;}
+.hg-source{appearance:none;border:0;background:none;padding:0;cursor:default;display:flex;align-items:center;border-radius:8px;}
 .hg-source:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
 .hg-title{font-weight:600;font-size:14px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .hg-btn{appearance:none;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:8px;font:inherit;font-size:12px;line-height:1;padding:7px 10px;cursor:pointer;white-space:nowrap;}
@@ -1130,7 +1130,6 @@ window.__ModuleLoader__.load({
                 className: 'hg-source',
                 type: 'button',
                 'aria-label': t('source.switch'),
-                title: `${t('source.switch')} · ${t('source.' + source)}`,
                 onClick: toggleSource,
               },
               h(Mark, { size: 18, tone: source === 'hghub' ? 'yellow' : 'red' }),
