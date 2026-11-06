@@ -10,7 +10,8 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
     "./vendor/*": "./vendor/*",
-    "./standalone/*": "./standalone/*"
+    "./standalone/*": "./standalone/*",
+    "./sdk/*": "./sdk/*"
   },
   "files": [
     "index.js",
@@ -18,6 +19,7 @@
     "cordis.patch.yml",
     "vendor/",
     "standalone/",
+    "sdk/",
     "locale/*.json",
     "icon.svg",
     "README.md"

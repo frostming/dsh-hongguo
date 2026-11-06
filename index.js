@@ -18,6 +18,19 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { createClient } from 'openhongguo'
+import {
+  createClient as createHgClient,
+  fetchMirrors,
+  probeLines,
+  HGHUB_LINES,
+  parseEpisodeId,
+  episodeId as makeEpisodeId,
+  isMediaHost,
+  decryptCover,
+} from './sdk/hghub/index.js'
+
+/** 备用片源的 id。两边路由都认这个名字。 */
+const HGHUB_SOURCE = 'hghub'
 
 export const name = 'dsh-hongguo'
 
@@ -30,6 +43,7 @@ function configSchema(z, DEFAULTS) {
   return z.object({
     autoPrompt: z.boolean().default(DEFAULTS.autoPrompt),
     panelWidth: z.number().step(1).min(320).max(960).default(DEFAULTS.panelWidth),
+    source: z.union(['hongguo', 'hghub']).default(DEFAULTS.source),
     profilePath: z.string(),
     searchTerms: z.array(z.string()).default(DEFAULTS.searchTerms),
   })
@@ -41,9 +55,9 @@ function configSchema(z, DEFAULTS) {
  * the wrong type falls back to the default instead of failing activation.
  */
 export async function reflectConfig(raw = {}) {
-  const DEFAULTS = { autoPrompt: true, panelWidth: 480, searchTerms: ['总裁', '重生', '逆袭'] }
+  const DEFAULTS = { autoPrompt: true, panelWidth: 480, source: 'hongguo', searchTerms: ['总裁', '重生', '逆袭'] }
   const input = Object.fromEntries(
-    Object.entries(raw ?? {}).filter(([key]) => ['autoPrompt', 'panelWidth', 'profilePath', 'searchTerms'].includes(key)),
+    Object.entries(raw ?? {}).filter(([key]) => ['autoPrompt', 'panelWidth', 'source', 'profilePath', 'searchTerms'].includes(key)),
   )
   let value
   try {
@@ -55,6 +69,7 @@ export async function reflectConfig(raw = {}) {
     value = { ...DEFAULTS }
     if (typeof input.autoPrompt === 'boolean') value.autoPrompt = input.autoPrompt
     if (Number.isFinite(input.panelWidth)) value.panelWidth = Math.min(960, Math.max(320, Math.round(input.panelWidth)))
+    if (input.source === 'hghub' || input.source === 'hongguo') value.source = input.source
     if (typeof input.profilePath === 'string') value.profilePath = input.profilePath
     if (Array.isArray(input.searchTerms)) value.searchTerms = input.searchTerms.map(String)
     if (!value.searchTerms.length) value.searchTerms = DEFAULTS.searchTerms
@@ -150,7 +165,7 @@ export function apply(ctx, config = {}) {
   const settings = reflectConfig(config)
   let resolved
   const ready = settings.then((value) => (resolved = value))
-  const readConfig = () => ({ autoPrompt: true, panelWidth: 480, searchTerms: ['总裁', '重生', '逆袭'], ...(resolved ?? config) })
+  const readConfig = () => ({ autoPrompt: true, panelWidth: 480, source: 'hongguo', searchTerms: ['总裁', '重生', '逆袭'], ...(resolved ?? config) })
   const dataDir = process.env.DSH_PLUGIN_DATA_DIR
     ? join(process.env.DSH_PLUGIN_DATA_DIR, 'dsh-hongguo')
     : join(homedir(), '.dsh', 'plugin-data', 'dsh-hongguo')
@@ -335,6 +350,8 @@ export function apply(ctx, config = {}) {
 
   /** Domains the proxy is allowed to fetch. */
   function allowedHost(hostname) {
+    // 备用片源（hghub）的分片与 key 落在 drleao.cn / hzjvlo.cn 这类 CDN 上。
+    if (isMediaHost(hostname)) return true
     return /(^|\.)(qznovelvod\.com|byteimg\.com|fqnovelpic\.com|douyinvod\.com|bytecdn\.cn|ibytedtos\.com|snssdk\.com)$/.test(hostname)
   }
 
@@ -439,7 +456,7 @@ export function apply(ctx, config = {}) {
     } catch {
       target = undefined
     }
-    if (!target || !/^https?:$/.test(target.protocol) || !/(^|\.)(fqnovelpic\.com|byteimg\.com|pstatp\.com|snssdk\.com|bytecdn\.cn)$/.test(target.hostname)) {
+    if (!target || !/^https?:$/.test(target.protocol) || !/(^|\.)(fqnovelpic\.com|byteimg\.com|pstatp\.com|snssdk\.com|bytecdn\.cn|drleao\.cn|huangguoai\.com|huangguoai\.ai)$/.test(target.hostname)) {
       response.statusCode = 400
       return response.end()
     }
@@ -470,6 +487,16 @@ export function apply(ctx, config = {}) {
     const type = upstream.headers.get('content-type') ?? ''
     const bytes = Buffer.from(await upstream.arrayBuffer())
     if (/^image\/(jpeg|png|webp|gif|avif)/.test(type)) return sendImage(bytes, type)
+    // 备用片源（hghub）的封面是 AES-128-CBC 密文：解出来是普通 JPEG，
+    // 不需要 HEIC 转换，也不依赖 ffmpeg。
+    try {
+      const plain = decryptCover(bytes)
+      await mkdir(coverDir, { recursive: true, mode: 0o700 })
+      await writeFile(cached, plain)
+      return sendImage(plain)
+    } catch {
+      // 不是这份密文，继续走下面的 HEIC 转换。
+    }
     // HEIC goes through the platform converter (sips on macOS, ffmpeg elsewhere).
     const rawPath = join(coverDir, `${key}.heic`)
     const outPath = `${key}.jpg`
@@ -654,6 +681,107 @@ export function apply(ctx, config = {}) {
     return refreshing
   }
 
+  // ---- 备用片源（hghub）----------------------------------------------------
+  // 第二个片源：HGhub 那套「单一信封接口」+ HLS（AES-128）。不签名、不登录、
+  // 不建设备档案，所以接线比主片源薄得多。默认不用，`source: hghub` 才切过来。
+  let hgClientPromise
+  /** 当前线路。默认第一条固定线路，失败时换镜像。 */
+  let hgLine = HGHUB_LINES[0].url
+  function hgClient() {
+    hgClientPromise ??= createHgClient({
+      base: hgLine,
+      timeoutMs: 25_000,
+      // 上游按窗口限流；批量拉列表时给一点间隔更稳。
+      minIntervalMs: 250,
+    }).catch((error) => {
+      hgClientPromise = undefined
+      throw error
+    })
+    return hgClientPromise
+  }
+
+  /** 线路不可达时换一条镜像重试一次。 */
+  async function withHgLine(fn) {
+    const sdk = await hgClient()
+    try {
+      return await fn(sdk)
+    } catch (error) {
+      if (!['NETWORK', 'HTTP', 'EDGE_ERROR', 'BAD_JSON'].includes(error?.code)) throw error
+      const next = await pickMirror(sdk.base).catch(() => undefined)
+      if (!next) throw error
+      logger.info?.(`[hghub] 线路 ${sdk.base} 失败，换 ${next}`)
+      sdk.setBase(next)
+      hgLine = next
+      return fn(sdk)
+    }
+  }
+
+  /** 从地址发布页挑一条可达的镜像（结果缓存五分钟）。 */
+  let hgMirrors
+  let hgMirrorsAt = 0
+  async function pickMirror(skip) {
+    if (!hgMirrors || Date.now() - hgMirrorsAt > 5 * 60_000) {
+      const found = await fetchMirrors({ limit: 8 }).catch(() => undefined)
+      hgMirrors = found?.items?.map((item) => item.url) ?? []
+      hgMirrorsAt = Date.now()
+    }
+    const candidates = hgMirrors.filter((value) => value !== skip).slice(0, 4)
+    if (candidates.length === 0) return undefined
+    const probed = await probeLines(candidates)
+    return probed.find((row) => row.ok)?.url
+  }
+
+  let hgGames = []
+  let hgGamesAt = 0
+  let hgRefreshing
+  const hgManifests = new Map()
+
+  /**
+   * 首页聚合 + 第一页列表拼成一份目录：首页几栏质量最高（精选/最新/分类），
+   * 不够 48 部再用全站列表补齐。只发两三个请求。
+   */
+  async function gatherHghub() {
+    const seen = new Map()
+    const push = (item) => {
+      if (!item?.id || seen.has(item.id) || seen.size >= 48) return
+      seen.set(item.id, {
+        id: item.id,
+        title: item.title,
+        description: item.description ?? '',
+        cover: item.cover,
+        episodes: item.episodes,
+        heat: item.hot,
+      })
+    }
+    await withHgLine(async (sdk) => {
+      const home = await sdk.home()
+      for (const item of home.featured) push(item)
+      for (const item of home.latest) push(item)
+      for (const section of home.categories) for (const item of section.items) push(item)
+      if (seen.size >= 24) return
+      const feed = await sdk.feed({ page: 1, size: 40 })
+      for (const item of feed.items) push(item)
+    })
+    return [...seen.values()].slice(0, 48)
+  }
+
+  function refreshHghub() {
+    hgRefreshing ??= (async () => {
+      try {
+        const items = await gatherHghub()
+        if (items.length > 0) {
+          hgGames = items
+          hgGamesAt = Date.now()
+        }
+      } catch (error) {
+        logger.warn?.(`[hghub] feed refresh failed: ${error?.message ?? error}`)
+      } finally {
+        hgRefreshing = undefined
+      }
+    })()
+    return hgRefreshing
+  }
+
   async function handleHttp(request, response, url) {
     const send = (status, body, type = 'application/json; charset=utf-8') => {
       response.statusCode = status
@@ -677,6 +805,13 @@ export function apply(ctx, config = {}) {
     }
 
     const path = url.pathname.slice(ROUTE_PREFIX.length) || '/'
+    /** 这条请求走哪个片源：显式 `?source=` 优先，否则看配置。 */
+    const usesHghub = (target) => {
+      const asked = target.searchParams.get('source')
+      if (asked === HGHUB_SOURCE) return true
+      if (asked === 'hongguo') return false
+      return readConfig().source === HGHUB_SOURCE
+    }
 
 
     if (path === '/media') {
@@ -765,10 +900,49 @@ export function apply(ctx, config = {}) {
       return
     }
 
+    if (path === '/hghub-manifest') {
+      const episodeId = url.searchParams.get('episode') ?? ''
+      const parsed = parseEpisodeId(episodeId)
+      if (!parsed) return send(400, { ok: false, error: { message: 'bad episode' } })
+      const cached = hgManifests.get(episodeId)
+      if (cached && Date.now() - cached.at < 45_000) {
+        response.statusCode = 200
+        response.setHeader('content-type', 'application/vnd.apple.mpegurl')
+        response.setHeader('cache-control', 'no-store')
+        return response.end(cached.body)
+      }
+      try {
+        const body = await withHgLine(async (sdk) => {
+          const info = await sdk.getPlay(parsed.videoId, parsed.ep)
+          const upstream = await fetch(info.videoUrl, {
+            headers: { 'user-agent': sdk.userAgent, referer: `${new URL(info.videoUrl).origin}/` },
+            signal: AbortSignal.timeout(30_000),
+          })
+          if (!upstream.ok) throw Object.assign(new Error(`播放列表 HTTP ${upstream.status}`), { status: 502, code: 'PLAYLIST_HTTP' })
+          return rewriteManifest(await upstream.text(), info.videoUrl)
+        })
+        hgManifests.set(episodeId, { body, at: Date.now() })
+        while (hgManifests.size > 32) hgManifests.delete(hgManifests.keys().next().value)
+        response.statusCode = 200
+        response.setHeader('content-type', 'application/vnd.apple.mpegurl')
+        response.setHeader('cache-control', 'no-store')
+        return response.end(body)
+      } catch (error) {
+        return send(error?.status ?? 502, { ok: false, error: { code: error?.code, message: String(error?.message ?? error) } })
+      }
+    }
+
     if (path === '/config') {
       return json(async () => {
         const current = readConfig()
-        return { autoPrompt: current.autoPrompt, panelWidth: current.panelWidth, searchTerms: current.searchTerms, profilePath }
+        return {
+          autoPrompt: current.autoPrompt,
+          panelWidth: current.panelWidth,
+          source: current.source,
+          sources: ['hongguo', HGHUB_SOURCE],
+          searchTerms: current.searchTerms,
+          profilePath,
+        }
       })
     }
 
@@ -782,6 +956,18 @@ export function apply(ctx, config = {}) {
     }
 
     if (path === '/feed') {
+      if (usesHghub(url)) {
+        return json(async () => {
+          if (hgGames.length > 0 && Date.now() - hgGamesAt < 15 * 60_000) return { items: hgGames }
+          if (hgGames.length > 0) {
+            refreshHghub()
+            return { items: hgGames }
+          }
+          await refreshHghub()
+          if (hgGames.length === 0) throw Object.assign(new Error('暂时拿不到备用片源的剧集列表'), { code: 'UNAVAILABLE' })
+          return { items: hgGames }
+        })
+      }
       return json(async () => {
         if (games.length > 0 && Date.now() - gamesAt < 15 * 60_000) return { items: games }
         // A list built a moment ago is good enough while a refresh runs: the
@@ -804,6 +990,20 @@ export function apply(ctx, config = {}) {
       const keyword = (url.searchParams.get('q') ?? '').trim().slice(0, 40)
       const cursor = (url.searchParams.get('cursor') ?? '').trim().slice(0, 32)
       if (!keyword) return send(400, { ok: false, error: { message: 'empty query' } })
+      if (usesHghub(url)) {
+        return json(async () => {
+          const page = await withHgLine((sdk) => sdk.search(keyword, { page: 1, size: 24 }))
+          return {
+            items: (page?.items ?? []).map((item) => ({
+              id: item.id,
+              title: item.title,
+              description: item.description ?? '',
+              cover: item.cover,
+              episodes: item.episodes,
+            })),
+          }
+        })
+      }
       return json(async () => {
         const sdk = await client()
         const search = () => sdk.search(keyword, cursor ? { cursor } : {})
@@ -845,6 +1045,27 @@ export function apply(ctx, config = {}) {
       return json(async () => {
         const id = url.searchParams.get('id')
         if (!id) throw Object.assign(new Error('missing id'), { status: 400 })
+        if (usesHghub(url)) {
+          // 详情里直接带分集列表，一次请求就够。
+          const detail = await withHgLine((sdk) => sdk.getVideo(id))
+          const known = hgGames.find((row) => String(row.id) === String(id))
+          return {
+            series: {
+              id: detail.id,
+              title: detail.title,
+              description: detail.description,
+              cover: detail.cover || known?.cover,
+              episodes: detail.episodes,
+            },
+            episodes: detail.episodeList.map((ep) => ({
+              // 本片源没有单集 id，用 `{videoId}_{ep}` 拼一个稳定的复合 id。
+              id: makeEpisodeId(detail.id, ep.number),
+              number: ep.number,
+              title: ep.title,
+              playable: ep.playable,
+            })),
+          }
+        }
         const sdk = await client()
         const series = await sdk.getSeries(id).catch(() => undefined)
         const episodes = await sdk.listEpisodes(id)
@@ -866,6 +1087,27 @@ export function apply(ctx, config = {}) {
         const episodeId = url.searchParams.get('episode')
         if (!episodeId) throw Object.assign(new Error('missing episode'), { status: 400 })
         const seriesId = url.searchParams.get('series') ?? undefined
+        if (usesHghub(url)) {
+          const parsed = parseEpisodeId(episodeId)
+          if (!parsed) throw Object.assign(new Error('bad episode'), { status: 400 })
+          const info = await withHgLine((sdk) => sdk.getPlay(parsed.videoId, parsed.ep))
+          return {
+            episodeId,
+            seriesId,
+            duration: info.duration,
+            preview: false,
+            // 标准 HLS + AES-128：key 由 hls.js 自己向 CDN 取，Host 只改写清单，
+            // 所以既不需要 ffmpeg，也不占 media/ 缓存。
+            protected: false,
+            sources: [
+              {
+                definition: 'HLS',
+                kind: 'hlsjs',
+                url: `${ROUTE_PREFIX}/hghub-manifest?episode=${encodeURIComponent(episodeId)}`,
+              },
+            ],
+          }
+        }
         const result = await loadStream(episodeId)
         const playback = result.playback
         const streams = (playback.streams ?? []).filter((stream) => stream.url)
@@ -945,6 +1187,8 @@ export function apply(ctx, config = {}) {
   // Build the list once at startup so the first page view does not wait for a
   // cold anonymous device.
   refreshFeed()
+  // 备用片源只在被设成默认时才预热（它没有冷设备的问题，第一次切换自己会拉）。
+  ready.then(() => { if (readConfig().source === HGHUB_SOURCE) refreshHghub() }).catch(() => {})
 
   // The Web server is optional in non-web profiles; everything else still works.
   ctx.inject(['webServer'], (web) => {

@@ -1,0 +1,20 @@
+{
+  "name": "hghub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "黄果短剧站的官方站非官方 API 客户端：边缘信封、线路切换、封面解密、HLS 播放地址",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "bin": {
+    "hghub": "./cli.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

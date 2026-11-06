@@ -4,3 +4,4 @@
       config:
         autoPrompt: true
         panelWidth: 480
+        source: hongguo

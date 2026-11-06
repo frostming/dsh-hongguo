@@ -57,15 +57,21 @@ dsh plugin add github:frostming/dsh-hongguo
 
 ## 结构
 
-- **Host 半（`index.js`）**：加载 openhongguo SDK、维护匿名设备档案，提供同源路由 `/api/hongguo/{feed,series,play,search,media,stream,config,open,running}`、`/api/hongguo/cover`、`/api/hongguo/vendor` 与 `/api/hongguo/window`（浏览器里的播放页）。启动时预先拉取剧集列表。CDN 只提供 HEIC 封面，Host 用 `sips`（macOS）或 `ffmpeg`（其他平台）转成 JPEG 并缓存。
+- **Host 半（`index.js`）**：加载 openhongguo SDK、维护匿名设备档案，提供同源路由 `/api/hongguo/{feed,series,play,search,media,stream,hghub-manifest,config,open,running}`、`/api/hongguo/cover`、`/api/hongguo/vendor` 与 `/api/hongguo/window`（浏览器里的播放页）。启动时预先拉取剧集列表。CDN 只提供 HEIC 封面，Host 用 `sips`（macOS）或 `ffmpeg`（其他平台）转成 JPEG 并缓存。
+- **备用片源（`sdk/hghub/`）**：一份不依赖第三方包的客户端，见 [`sdk/hghub/README.md`](sdk/hghub/README.md)。它按 [Minireel/HGhub](https://github.com/Minireel/HGhub) 的做法对接「单一信封接口」：站点把全部 `/api/**` 收敛成一个 `POST /api/edge/request`，客户端只往里填 `path`——不签名、不登录、也不建任何设备档案。默认片源仍是红果，`source: hghub` 才切过去。
 - **Client 半（`client.js`）**：注册侧边栏标签页类型 `hongguo`、侧栏底部按钮、`conversation.input.dock` 里的等待提示，以及把播放交给浏览器的 ↗ 按钮。
 - **播放页（`standalone/`）**：一个不依赖 DSH React 运行时的页面（`index.html` + `app.js` + `app.css`），只调用上面那些同源路由；播放位置与音量写在与边栏相同的 localStorage 记录里，两边互通。
 
 ## 播放与解密
 
-视频是 CENC（cenc-aes-ctr）加密的 HEVC，浏览器无法直接解码。Host 用 SDK 解析出的内容密钥调用本机 `ffmpeg` 解密并重封装为普通 MP4（`-c copy`，不重编码），缓存在插件数据目录 `media/`（保留最近 40 集）。页面只拿到同源 `/api/hongguo/media` 地址，密钥不出 Host。
+视频是 CENC（cenc-aes-ctr）加密的 HEVC，浏览器无法直接解码（这是 `hongguo` 片源）。Host 用 SDK 解析出的内容密钥调用本机 `ffmpeg` 解密并重封装为普通 MP4（`-c copy`，不重编码），缓存在插件数据目录 `media/`（保留最近 40 集）。页面只拿到同源 `/api/hongguo/media` 地址，密钥不出 Host。
 
 需要安装 ffmpeg：macOS `brew install ffmpeg`，Windows `winget install Gyan.FFmpeg`，其他平台用系统包管理器安装。封面转换复用同一个 ffmpeg，所以在 Windows / Linux 上没有 ffmpeg 时海报会显示占位图。
+
+`hghub` 片源走的是另一条路：标准 HLS + AES-128，`#EXT-X-KEY` 指向 CDN 上的 16 字节密钥。
+Host 只改写 m3u8（把分片与 key 指向同源 `/api/hongguo/stream`），**不解密**——
+hls.js 自己向 CDN 取密钥并解密。所以这条路不需要 ffmpeg，也不占 `media/` 缓存；
+封面是 AES-128-CBC 密文，Host 直接解密，同样不需要 ffmpeg。
 
 ## 配置
 
@@ -75,5 +81,6 @@ dsh plugin add github:frostming/dsh-hongguo
 |---|---|---|
 | `autoPrompt` | `true` | Agent 运行时是否显示提示 |
 | `panelWidth` | `480` | 播放器标签页的默认宽度（px） |
+| `source` | `hongguo` | 默认片源：`hongguo`（红果）或 `hghub`（备用）。单条请求可用 `?source=` 覆盖 |
 | `profilePath` | 插件数据目录 | 匿名设备档案文件；删除即更换设备 |
 | `searchTerms` | `总裁/重生/逆袭` | 推荐不足时补充列表用的搜索词 |
