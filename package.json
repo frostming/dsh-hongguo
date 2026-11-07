@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "摸鱼短剧：右侧边栏短剧播放器，等待 Agent 时提示调出（基于 openhongguo）",
+  "license": "MIT",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -22,7 +23,8 @@
     "sdk/",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {

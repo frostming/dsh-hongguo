@@ -84,3 +84,7 @@ hls.js 自己向 CDN 取密钥并解密。所以这条路不需要 ffmpeg，也�
 | `source` | `hongguo` | 默认片源：`hongguo`（红果）或 `hghub`（备用）。单条请求可用 `?source=` 覆盖 |
 | `profilePath` | 插件数据目录 | 匿名设备档案文件；删除即更换设备 |
 | `searchTerms` | `总裁/重生/逆袭` | 推荐不足时补充列表用的搜索词 |
+
+## 许可证
+
+[MIT](LICENSE)。`vendor/` 下的第三方播放库沿用各自的许可证（见同目录的 LICENSE 文件）；短剧内容版权归权利人所有。
