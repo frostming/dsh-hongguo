@@ -1121,16 +1121,11 @@ window.__ModuleLoader__.load({
       }, [source])
 
       /** Continue exactly where the history left off. */
+      // Opening the drama is what resumes it: openSeries picks the history
+      // record's episode and second, and shows the drama's page.
       const continueWatching = React.useCallback(
-        (row) => {
-          fetchSeries(row.seriesId, source)
-            .then((episodes) => {
-              const episode = episodes.find((item) => item.id === row.episodeId) ?? episodes[0]
-              if (episode) playEpisode(episode, row.episodeId === episode.id ? row.position : 0)
-            })
-            .catch(() => {})
-        },
-        [playEpisode, source],
+        (row) => openSeries(feed.items.find((item) => item?.id === row.seriesId) ?? { id: row.seriesId, title: row.title }),
+        [openSeries, feed.items],
       )
 
       /** 图标切换片源：主用 ↔ 备用；列表、分集、历史都跟着换。 */
