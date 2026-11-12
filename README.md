@@ -12,7 +12,7 @@ npm 上的 `dsh-hongguo` 不是本插件，请从 GitHub 安装：
 dsh plugin add github:frostming/dsh-hongguo
 ```
 
-依赖 `openhongguo` 会从 npm 一并安装。
+`openhongguo` 随插件放在 `sdk/openhongguo/`：npm 上的 0.2.0 还没有 11 月 10 日后播放所需的签名修复，这里用的是上游 main 的构建（来源见 `sdk/openhongguo/UPSTREAM`）。
 
 > 本仓库是个人 fork：新增浏览器播放页、倍速选择、滚轮调音量与画中画。上游项目见 [frostming/dsh-hongguo](https://github.com/frostming/dsh-hongguo)。
 

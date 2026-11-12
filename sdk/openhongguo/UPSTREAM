@@ -1,0 +1,2 @@
+Built from beilunyang/openhongguo@015a388 (bindings/node, `npm run build`).
+Vendored until a release with the playback Argus/Ladon signing fix (bed1459) reaches npm.

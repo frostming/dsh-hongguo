@@ -17,7 +17,8 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
-import { createClient } from 'openhongguo'
+// Built from upstream main until the playback signing fix is on npm; see sdk/openhongguo/UPSTREAM.
+import { createClient } from './sdk/openhongguo/index.js'
 import {
   createClient as createHgClient,
   fetchMirrors,
