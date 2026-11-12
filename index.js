@@ -288,9 +288,23 @@ export function apply(ctx, config = {}) {
       const encrypted = join(mediaDir, `${episodeId}.part.enc`)
       const partial = join(mediaDir, `${episodeId}.part.mp4`)
       try {
-        const upstream = await fetch(entry.url, { signal: AbortSignal.timeout(60_000) })
-        if (!upstream.ok) throw new Error(`CDN HTTP ${upstream.status}`)
-        await writeFile(encrypted, Buffer.from(await upstream.arrayBuffer()))
+        // The CDN drops the odd connection; a few spaced attempts ride it out.
+        let body
+        for (let attempt = 0; !body; attempt += 1) {
+          try {
+            const upstream = await fetch(entry.url, { signal: AbortSignal.timeout(60_000) })
+            if (!upstream.ok) throw Object.assign(new Error(`CDN HTTP ${upstream.status}`), { status: upstream.status })
+            body = Buffer.from(await upstream.arrayBuffer())
+          } catch (error) {
+            if (attempt >= 3 || (error?.status >= 400 && error?.status < 500)) {
+              // A refused or expired address: resolve a fresh one next time.
+              mediaKeys.delete(episodeId)
+              throw error
+            }
+            await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)))
+          }
+        }
+        await writeFile(encrypted, body)
         await runFfmpeg(
           ['-v', 'error', '-y', '-decryption_key', entry.key, '-i', encrypted, '-map', '0', '-c', 'copy', '-tag:v', 'hvc1', '-movflags', '+faststart', partial],
           { timeout: 120_000 },

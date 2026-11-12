@@ -275,6 +275,36 @@ function pickSource(sources, definition) {
 
 // ---- playback ---------------------------------------------------------
 
+// Requesting an episode's play model starts its download and decryption on
+// the Host, so the next episode is asked for while this one plays.
+const prefetched = new Map()
+let prefetching
+function maybePrefetchNext() {
+  const next = nextEpisode()
+  if (!next || prefetched.has(next.id) || prefetching === next.id) return
+  if (!(video.currentTime >= Math.min(10, (video.duration || 0) * 0.3))) return
+  prefetching = next.id
+  const params = new URLSearchParams({ episode: next.id })
+  if (state.series?.id) params.set('series', state.series.id)
+  api(`/play?${params}`)
+    .then((data) => {
+      prefetched.set(next.id, { data, at: Date.now() })
+      while (prefetched.size > 2) prefetched.delete(prefetched.keys().next().value)
+    })
+    .catch(() => {})
+    .finally(() => {
+      if (prefetching === next.id) prefetching = undefined
+    })
+}
+function takePrefetched(episodeId) {
+  const entry = prefetched.get(episodeId)
+  if (!entry) return undefined
+  prefetched.delete(episodeId)
+  const expires = Number(entry.data?.expiresAt) * 1000
+  const fresh = Number.isFinite(expires) && expires > 0 ? expires - Date.now() > 60_000 : Date.now() - entry.at < 5 * 60_000
+  return fresh ? entry.data : undefined
+}
+
 /** Play one episode, resuming where the record or the caller says. */
 async function play(episode, at, definition) {
   if (!episode?.id) return
@@ -286,7 +316,7 @@ async function play(episode, at, definition) {
   try {
     const params = new URLSearchParams({ episode: episode.id })
     if (state.series?.id) params.set('series', state.series.id)
-    const data = await api(`/play?${params}`)
+    const data = takePrefetched(episode.id) ?? (await api(`/play?${params}`))
     state.sources = data.sources ?? []
     const source = pickSource(state.sources, definition)
     if (!source) throw new Error('这一集没有可用的清晰度')
@@ -326,6 +356,7 @@ video.addEventListener('loadedmetadata', () => {
 let lastSaved = 0
 video.addEventListener('timeupdate', () => {
   if (!state.series || !state.current) return
+  if (!video.paused) maybePrefetchNext()
   if (Math.abs(video.currentTime - lastSaved) < 1) return
   lastSaved = video.currentTime
   saveProgress(state.series, state.current, video.currentTime)

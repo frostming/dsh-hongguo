@@ -668,6 +668,50 @@ window.__ModuleLoader__.load({
      * Load one episode's play model and start it, optionally at a position
      * remembered from an earlier viewing.
      */
+    // ---- next-episode prefetch -------------------------------------------
+    // Asking the Host for an episode's play model is what starts its download
+    // (and, for the main source, its decryption), so requesting the next one
+    // while this one plays makes "next" start almost at once.
+    const prefetched = new Map()
+    const prefetchKey = (source, episodeId) => `${source}:${episodeId}`
+    /** A play model fetched ahead of time, while it is still good to use. */
+    function takePrefetched(source, episodeId) {
+      const key = prefetchKey(source, episodeId)
+      const entry = prefetched.get(key)
+      if (!entry) return undefined
+      prefetched.delete(key)
+      const expires = Number(entry.data?.expiresAt) * 1000
+      const fresh = Number.isFinite(expires) && expires > 0 ? expires - Date.now() > 60_000 : Date.now() - entry.at < 5 * 60_000
+      return fresh ? entry.data : undefined
+    }
+    function maybePrefetchNext() {
+      const { playback, playing, series, source, current } = shared.state
+      if (playback.status !== 'ready' || !playing || !current) return
+      // Right after a switch the old episode's state and its last time update
+      // linger for a moment; only the element already on this episode counts.
+      if (playback.data?.episodeId && playback.data.episodeId !== current.id) return
+      const active = sharedActiveSource()
+      const video = videoRef.current
+      const attached = `${active?.url}:${shared.state.retryKey}`
+      if (!active || !video || engine.key !== attached || engine.loadedKey !== attached) return
+      // Not on the first seconds: a user skimming episodes should not fan out.
+      if (!(video.currentTime >= Math.min(10, (video.duration || 0) * 0.3))) return
+      const next = sharedNextEpisode()
+      if (!next) return
+      const key = prefetchKey(source, next.id)
+      if (prefetched.has(key) || prefetching.has(key)) return
+      prefetching.add(key)
+      fetchPlayback(next.id, series?.id, source)
+        .then((data) => {
+          prefetched.set(key, { data, at: Date.now() })
+          // Only the episode after the current one is worth keeping.
+          while (prefetched.size > 2) prefetched.delete(prefetched.keys().next().value)
+        })
+        .catch(() => {})
+        .finally(() => prefetching.delete(key))
+    }
+    const prefetching = new Set()
+
     function playEpisodeShared(episode, resumeAt = 0) {
       const { series, source } = shared.state
       const record = listHistory(source).find((row) => row.seriesId === series?.id)
@@ -677,7 +721,8 @@ window.__ModuleLoader__.load({
       setShared('current', { id: episode.id, number: episode.number })
       setShared('playback', { status: 'loading', data: undefined, error: undefined })
       setShared('progress', { time: 0, duration: 0 })
-      fetchPlayback(episode.id, series?.id, source)
+      const ready = takePrefetched(source, episode.id)
+      ;(ready ? Promise.resolve(ready) : fetchPlayback(episode.id, series?.id, source))
         .then((data) => {
           // A later pick has already replaced this one.
           if (shared.state.current?.id !== episode.id) return
@@ -716,6 +761,8 @@ window.__ModuleLoader__.load({
         }
       })
       video.addEventListener('loadedmetadata', () => {
+        // From here on, currentTime belongs to the attached source.
+        engine.loadedKey = engine.key
         video.playbackRate = rateRef.current
         if (video.videoWidth && video.videoHeight) setShared('aspect', video.videoWidth / video.videoHeight)
         const { position, resumed } = resumeRef.current
@@ -752,6 +799,7 @@ window.__ModuleLoader__.load({
     function stopEngine() {
       const { player, kind } = engine
       engine.key = undefined
+      engine.loadedKey = undefined
       engine.kind = undefined
       engine.player = undefined
       try {
@@ -913,10 +961,13 @@ window.__ModuleLoader__.load({
     function startSharedPlayer() {
       const timer = setInterval(followTick, 400)
       const unsubscribe = subscribeShared(syncEngine)
+      const unsubscribePrefetch = subscribeShared(maybePrefetchNext)
       syncEngine()
       return () => {
         clearInterval(timer)
         unsubscribe()
+        unsubscribePrefetch()
+        prefetched.clear()
         clearTimeout(lostTimer)
         stopEngine()
         try {
